@@ -29,6 +29,8 @@ sub register {
 
 1;
 
+=encoding utf-8
+
 =head1 USAGE
 
 Place your YAML configuration files under a ./config sub-directory from your mojo app's home directory.
