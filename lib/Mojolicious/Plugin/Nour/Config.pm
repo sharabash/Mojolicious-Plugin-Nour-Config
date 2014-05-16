@@ -1,14 +1,24 @@
 package Mojolicious::Plugin::Nour::Config;
 use Mojo::Base 'Mojolicious::Plugin';
 use Nour::Config; has '_nour_config';
+use List::AllUtils qw/:all/;
+use Linux::Inotify2;
+use IO::All;
+use File::Find;
 # ABSTRACT: Robustly imports config from a ./config sub-directory loaded with nested YAML files
 
 sub register {
     my ( $self, $app, $opts ) = @_;
     my $helpers = delete $opts->{ '-helpers' };
     my $silence = delete $opts->{ '-silence' };
+    my $watcher = delete $opts->{ '-watcher' };
 
-    $self->_nour_config( new Nour::Config ( %{ $opts } ) );
+    $app->helper( _config_nour => sub {
+        $self->_nour_config( new Nour::Config ( %{ $opts } ) );
+        return $self->_nour_config->config;
+    } );
+
+    $app->_config_nour;
 
     if ( $helpers ) { # inherit some helpers from Nour::Base
         do { my $method = $_; eval qq|
@@ -24,8 +34,118 @@ sub register {
 
     $app->log->debug( 'config', $app->dumper( $current ) ) unless $silence;
 
+    if ( $watcher ) {
+        for ( my $spawn = fork ) {
+            if ( not defined $spawn ) { # resource not available
+                $app->log->warn( "nour-config watcher said: resource not available?" );
+            }
+            elsif ( $spawn eq -1 ) { # can't fork
+                $app->log->warn( "nour-config watcher said: can't fork?" );
+            }
+            elsif ( $spawn eq 0 ) { # child process
+                $self->watcher_run( $app );
+            }
+            else { # parent process
+                $self->_watcher_pid( $_ );
+                $_ > io( $self->_watcher_file );
+            }
+        }
+    }
+
     return $current;
 }
+
+has '_watcher_pid';
+has '_watcher_file' => sub { '/tmp/nour-config.watcher.pid' };
+has '_watcher_inotify' => sub { new Linux::Inotify2 };
+sub DESTROY {
+    my $self = shift;
+    $self->watcher_kill;
+}
+sub watcher_kill {
+    my ( $self, $sig ) = @_;
+    my ( $file, $pid ) = ( $self->_watcher_file, $self->_watcher_pid );
+
+    $pid = $self->watcher_pid unless $pid;
+    $sig //= 'kill';
+
+    system 'rm', qw/-f/, $file if -e $file;
+    system 'kill', qw/-s/, $sig, $pid if $pid;
+
+    return $pid;
+}
+
+sub watcher_pid {
+    my ( $self ) = @_;
+    my ( $pid, $file ) = ( $self->_watcher_pid, $self->_watcher_file );
+
+    return $pid if $pid;
+
+    $pid = io( $file )->all if -e $file;
+    $pid =~ s/[^\d]*//g if $pid;
+    $pid = `ps aux | grep --color=never " $pid " | grep -v grep | awk -F' ' '{ print \$2 }' | grep "^$pid\$"` if $pid;
+    $pid =~ s/[^\d]*//g if $pid;
+
+    $self->_watcher_pid( $pid ) if $pid;
+    return $pid;
+}
+
+sub watcher_run {
+    my ( $self, $app ) = @_;
+    my ( @path, %while ) = ( @{ $self->_nour_config->_path_list } );
+    my ( $watch, $event, $changed );
+
+    $changed = sub {
+        my ( $file, $notice ) = @_;
+        return (
+            -f $file
+                and not $file =~ /\/\.[^\/]+\.sw.$/
+                and     $file =~ /[^\/]+\.[^\/]+$/
+                and (   $file =~ /\.ep$/
+                    or  $file =~ /\.pm$/
+                    or  $file =~ /\.yml$/ )
+                and (
+                        $notice->IN_MODIFY or
+                        $notice->IN_DELETE or
+                        $notice->IN_CLOSE_WRITE or
+                        $notice->IN_MOVED_TO
+                )
+        );
+    };
+
+    $event = sub {
+        my $notice = shift;
+        my $file = $notice->fullname;
+        $while{poll} = 0 if -d $file and $notice->IN_CREATE;
+        do {
+            $while{poll} = 0;
+            sleep 1;
+        } if $changed->( $file, $notice );
+    };
+
+    $watch = sub {
+        my @watched;
+        find( { wanted => sub {
+            my $path = File::Spec->rel2abs( $File::Find::name );
+            push @watched, $path if -d $path;
+        } }, @path );
+        @watched = uniq @watched;
+        $self->_watcher_inotify->watch( $_, IN_ALL_EVENTS, $event ) for @watched;
+    };
+
+    $while{loop} = 1;
+    while ( $while{loop} ) {
+        my $conf = $app->config;
+        $conf->{foo}{bar}{baz}++;
+        my $nour = $app->_config_nour;
+        %{ $conf } = ( %{ $conf }, %{ $nour } );
+        $watch->();
+        $while{poll} = 1;
+        $self->_watcher_inotify->poll while $while{poll};
+    }
+}
+
+
 
 1;
 
